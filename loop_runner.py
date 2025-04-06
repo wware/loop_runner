@@ -3,13 +3,15 @@
 
 This script automates the process of fixing code quality issues by:
 1. Running code quality checks (pylint, flake8, pytest)
-2. Sending the output to an LLM (running on Ollama)
+2. Sending the output to an LLM (either Groq API or local Ollama)
 3. Applying the suggested fixes
 4. Repeating until all checks pass
 
-The script uses Docker to run the LLM server, ensuring consistent
-access to the model without local dependencies. Code checks are
-run directly on the host machine.
+The script can use either:
+- Groq's API for fast, cloud-based inference
+- Docker to run a local Ollama LLM server
+
+Code checks are run directly on the host machine.
 
 Usage:
     python loop_runner.py [options] <filenames>
@@ -30,9 +32,9 @@ Markdown format, which are then written back to disk:
 
 import os
 import re
-import subprocess
 import sys
 import asyncio
+import subprocess
 import argparse
 from typing import Optional
 import jinja2
@@ -140,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-m", "--model",
         help="what LLM to use",
-        default="codellama"
+        default="????"
     )
     parser.add_argument(
         "-i", "--iterations",
@@ -149,17 +151,29 @@ def parse_args() -> argparse.Namespace:
         default=100
     )
     parser.add_argument(
+        "-L", "--local",
+        action="store_true",
+        help="run a local LLM server using Ollama docker container"
+    )
+    parser.add_argument(
         "--linters",
         default="ruff,pylint,flake8,pytest",
         help="comma-separated list of code quality checkers"
     )
     parser.add_argument(
         "--llm-url",
-        default="http://localhost:11434/v1/chat/completions",
+        default="https://api.groq.com/openai/v1/chat/completions",
         help="URL of the LLM server"
+    )
+    parser.add_argument(
+        "--api-key",
+        help="Groq API key",
+        default=os.getenv("GROQ_API_KEY", "????")
     )
     args = parser.parse_args()
     DEBUG = args.debug
+    if args.model == "????":
+        args.model = "codellama" if args.local else "qwen-2.5-32b"
     return args
 
 
@@ -237,38 +251,48 @@ def _parse_llm_output(output: str) -> tuple[str, list[File]]:
     return explanation, files
 
 
-async def get_llm_response(model: str, prompt: str) -> tuple[str, list[File]]:
-    """Get a response from the LLM via Ollama's HTTP API.
-
-    Sends the prompt to the locally running Ollama server and parses the response
-    into an explanation and a list of diffs. The LLM is expected to format
-    its response in Markdown with file diffs.
+async def get_llm_response(model: str, prompt: str, api_key: str, local: bool = False) -> tuple[str, list[File]]:
+    """Get a response from either Groq API or local Ollama server.
 
     Args:
-        model (str): Name of the Ollama model to use
+        model (str): Name of the model to use
         prompt (str): The formatted prompt to send
+        api_key (str): Groq API key (only used for remote)
+        local (bool): Whether to use local Ollama server
 
     Returns:
         tuple containing:
         - explanation (str): LLM's explanation of changes
         - new versions (list[File]): List of changed file contents
-
-    Raises:
-        requests.exceptions.RequestException: If API call fails
     """
     try:
-        response = requests.post(
-            'http://localhost:11434/api/generate',
-            json={'model': model, 'prompt': prompt, 'stream': False},
-            timeout=5*MINUTE
-        )
+        if local:
+            response = requests.post(
+                'http://localhost:11434/api/generate',
+                json={'model': model, 'prompt': prompt, 'stream': False},
+                timeout=5*MINUTE
+            )
+        else:
+            response = requests.post(
+                'https://api.groq.com/openai/v1/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {api_key}',
+                    'Content-Type': 'application/json'
+                },
+                json={
+                    'model': model,
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'temperature': 0.1
+                },
+                timeout=5*MINUTE
+            )
         response.raise_for_status()
-        output = response.json()['response']
+        output = response.json()['response'] if local else response.json()['choices'][0]['message']['content']
         if DEBUG > 0:
             print(output)
         return _parse_llm_output(output)
     except requests.exceptions.RequestException as e:
-        print(f"Error calling Ollama API: {e}")
+        print(f"Error calling {'Ollama' if local else 'Groq'} API: {e}")
         return "", []
 
 
@@ -342,32 +366,7 @@ async def run_all_checks(linters: str, *sources: str) -> list[Issue]:
 
 
 async def start_ollama_server(model: str) -> str:
-    """Start the Ollama server in a container.
-
-    Launches a Docker container running the Ollama server which provides
-    LLM capabilities via HTTP API. The server:
-    - Runs in detached mode (-d flag)
-    - Maps the host's ~/ollama_data to container's model storage
-    - Exposes port 11434 for API access
-    - Auto-removes container when stopped (--rm flag)
-
-    After starting the server, pulls the requested model to ensure
-    it's available for use. The pull operation may take several
-    minutes for large models being downloaded for the first time.
-
-    Args:
-        model (str): Name of the model to pull (e.g. "llama2", "qwen2.5-coder")
-
-    Returns:
-        str: Container ID of the started server, used for cleanup
-
-    Raises:
-        RuntimeError: If port 11434 is already in use
-        subprocess.SubprocessError: If server fails to start
-        TimeoutError: If server doesn't respond within 30 seconds
-        requests.exceptions.RequestException: If model pull fails
-        IOError: If volume mount paths don't exist
-    """
+    """Start the Ollama server in a container."""
     # Kill any container using port 11434
     cmd = ["docker", "ps", "-q", "--filter", "publish=11434"]
     proc = await asyncio.create_subprocess_exec(
@@ -437,6 +436,66 @@ async def start_ollama_server(model: str) -> str:
     return container_id
 
 
+async def apply_fixes(file: File, files: list[str]) -> None:
+    """Apply fixes to a file and update the files list if needed.
+
+    Args:
+        file: File object containing the new content
+        files: List of files being processed
+    """
+    old_content = open(file.name, "r", encoding="utf-8").read()
+    if old_content == file.content:
+        # the LLM didn't change the file, so stop trying to fix it
+        files.remove(file.name)
+        return
+
+    with open(file.name, "w", encoding="utf-8") as f:
+        f.write(file.content)
+
+
+async def process_iteration(
+    files: list[str],
+    model: str,
+    api_key: str,
+    local: bool,
+    linters: str
+) -> tuple[str, bool]:
+    """Process one iteration of the fix loop.
+
+    Args:
+        files: List of files to process
+        model: Name of the LLM model to use
+        api_key: API key for Groq
+        local: Whether to use local Ollama
+        linters: Comma-separated list of linters to run
+
+    Returns:
+        tuple containing:
+        - explanation: LLM's explanation of changes
+        - should_continue: Whether to continue iterations
+    """
+    # Run checks
+    results: list[Issue] = await run_all_checks(linters, *files)
+    if all(issue.code == 0 for issue in results):
+        return "", False
+
+    # Generate prompt
+    prompt = generate_prompt(results, files)
+    if DEBUG > 0:
+        print("Prompt: ***[[[[[[\n" + prompt + "\n]]]]]]***")
+
+    # Get and apply fixes
+    explanation, noobs = await get_llm_response(model, prompt, api_key, local)
+    for file in noobs:
+        await apply_fixes(file, files)
+
+    if len(files) == 0:
+        print("No files left to fix")
+        return explanation, False
+
+    return explanation, True
+
+
 async def main():
     """Main entry point"""
     args = parse_args()
@@ -444,39 +503,34 @@ async def main():
     iterations = args.iterations
     history = []  # List of explanations
 
-    container_id = await start_ollama_server(args.model)
+    container_id = None
     try:
-        while True:
-            # Run checks
-            results: list[Issue] = await run_all_checks(args.linters, *files)
-            if all(issue.code == 0 for issue in results):
+        if args.local:
+            container_id = await start_ollama_server(args.model)
+
+        while iterations > 0:
+            explanation, should_continue = await process_iteration(
+                files,
+                args.model,
+                args.api_key,
+                args.local,
+                args.linters
+            )
+
+            if explanation:
+                history.append(explanation)
+
+            if not should_continue:
                 break
-            # Generate prompt
-            prompt = generate_prompt(results, files)
-            if DEBUG > 0:
-                print("Prompt: ***[[[[[[\n" + prompt + "\n]]]]]]***")
-            explanation, noobs = await get_llm_response(args.model, prompt)
-            history.append(explanation)
-            for file in noobs:
-                old_content = open(file.name, "r", encoding="utf-8").read()
-                if old_content == file.content:
-                    # the LLM didn't change the file, so stop trying to fix it
-                    files.remove(file.name)
-                    continue
-                with open(file.name, "w", encoding="utf-8") as f:
-                    f.write(file.content)
-            if len(files) == 0:
-                print("No files left to fix")
-                break
+
             iterations -= 1
             if iterations == 0:
                 print("Max iterations reached")
-                if len(noobs) > 0:
-                    print(f"There are still {len(noobs)} files with remaining issues")
-                break
+                print(f"There are still {len(files)} files with remaining issues")
+
     finally:
         print("\n".join(history))
-        # Clean up server at end
+        # Clean up server if it was started
         if container_id:
             cmd = ['docker', 'stop', container_id]
             proc = await asyncio.create_subprocess_exec(*cmd)

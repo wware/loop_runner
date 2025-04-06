@@ -20,6 +20,7 @@
 1. DO NOT DISCARD ANY DOCSTRINGS OR COMMENTS.
 2. If docstrings or comments are misleading, propose a fix for them.
 3. If any docstrings are missing, add them.
+4. Fill in any missing type hints or annotations.
 
 ## Your response should be in Markdown format, looking like this:
 
