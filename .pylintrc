@@ -1,0 +1,13 @@
+[MESSAGES CONTROL]
+disable=W0621,W0511,W0718,W1514,W0603
+
+[FORMAT]
+max-line-length=150
+
+[BASIC]
+good-names=f,i,j,k,ex,Run,_
+
+[MASTER]
+ignore=CVS
+persistent=yes
+load-plugins=
