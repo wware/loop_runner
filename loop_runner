@@ -1,0 +1,7 @@
+#!/bin/bash
+if [ -z "$LOOP_RUNNER_VENV" ]; then
+    echo "Please set LOOP_RUNNER_VENV to point to the virtualenv"
+    exit 1
+fi
+
+exec $LOOP_RUNNER_VENV/bin/python /home/wware/loop_runner/loop_runner.py "$@"

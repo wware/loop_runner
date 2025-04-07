@@ -31,15 +31,15 @@ Markdown format, which are then written back to disk:
 """
 
 import os
-import re
 import sys
+import re
 import asyncio
-import subprocess
 import argparse
-from typing import Optional
 import jinja2
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+import docker
+from docker.errors import NotFound, APIError
 
 MINUTE: float = 60.0
 DEBUG: int = 0
@@ -55,50 +55,208 @@ The LLM runs in a Docker container. Code checks and patching are
 done directly on the host machine.
 """
 
+PROMPT_TEMPLATE = """\
+# Please fix the following issues in some Python source files
 
-class Issue(BaseModel):
-    """Represents a code quality issue found by a checker
+## Source files
+
+{% for file in files %}
+### {{ file }}
+
+```python
+{{ lookup[file].content }}
+```
+
+#### Linter stdout
+{{ lookup[file].stdout }}
+
+#### Linter stderr
+{{ lookup[file].stderr }}
+{% endfor %}
+
+## Instructions
+
+1. DO NOT DISCARD ANY DOCSTRINGS OR COMMENTS.
+2. If docstrings or comments are misleading, propose a fix for them.
+3. If any docstrings are missing, add them.
+4. Fill in any missing type hints or annotations.
+
+## Your response should be in Markdown format, looking like this:
+
+### path/to/file.py
+
+Provide an explanation of the issue as you see it and how you
+propose to fix it. Use a triple-backtick-python block to show the
+new version of the file. Show the ENTIRE CONTENT of the file, not
+just a diff. Remember, "path/to/file.py" is a placeholder. Replace
+it with the actual path to the file.
+"""
+
+
+class LinterRun(BaseModel):
+    """Represents a linter run configuration before execution.
 
     Attributes:
-        filename: Path to the file containing the issue
-        code: Exit status of the check (0 for success)
-        content: Combined stdout/stderr from the check
+        path (str): Path to the file being linted
+        cmd (str): Command used to run the linter
     """
-    filename: str
+    path: str
+    cmd: str
+    content: str   # contents of the file being linted
+
+    model_config = ConfigDict(frozen=True)
+
+    def __init__(self, path: str, cmd: str):
+        with open(path, "r", encoding="utf-8") as f:
+            super().__init__(
+                path=path,
+                cmd=cmd,
+                content=f.read()
+            )
+
+    async def run(self) -> 'CompletedLinterRun':
+        """Execute the linter command and return a CompletedLinterRun.
+
+        Returns:
+            CompletedLinterRun: A new instance with the run results
+        """
+        proc = await asyncio.create_subprocess_exec(
+            self.cmd, self.path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        code = -1 if proc.returncode is None else proc.returncode
+        stdout_str = stdout.decode()
+        stderr_str = stderr.decode()
+
+# pylint: disable=unexpected-keyword-arg
+        return CompletedLinterRun(
+            path=self.path,
+            cmd=self.cmd,
+            content=self.content,
+            code=code,
+            stdout=stdout_str,
+            stderr=stderr_str
+        )
+# pylint: enable=unexpected-keyword-arg
+
+
+class CompletedLinterRun(LinterRun):
+    """Represents a completed linter run with its outputs and status.
+
+    Attributes:
+        path (str): Path to the file being linted
+        cmd (str): Command used to run the linter
+        content (str): Contents of the file being linted
+        code (int): Return code from the linter (0 for success)
+        stdout (str): Standard output from the linter
+        stderr (str): Standard error from the linter
+    """
     code: int
-    content: str
+    stdout: str
+    stderr: str
 
-    def to_dict(self) -> dict:
-        """Convert the issue to a dictionary for serialization"""
-        return {
-            "filename": self.filename,
-            "content": self.content
-        }
+    model_config = ConfigDict(frozen=True)
+
+    # pylint: disable=non-parent-init-called
+    # pylint: disable=super-init-not-called
+    def __init__(self, *, path: str, cmd: str, content: str, code: int, stdout: str, stderr: str):
+        BaseModel.__init__(
+            self,
+            path=path,
+            cmd=cmd,
+            content=content,
+            code=code,
+            stdout=stdout,
+            stderr=stderr
+        )
+    # pylint: enable=non-parent-init-called
+    # pylint: enable=super-init-not-called
 
 
-class File(BaseModel):
-    """Represents a source file to be checked and potentially modified
+class ProposedFix(BaseModel):
+    """Represents a fix proposed by the LLM for a code quality issue.
+
+    This class encapsulates a proposed code fix, including the file path,
+    the LLM's explanation of the changes, and the new content to be written
+    to the file.
 
     Attributes:
-        name: Path to the file
-        content: Current content of the file, read from disk if not provided
+        path (str): Path to the file being modified
+        explanation (str): LLM's explanation of what changes were made and why
+        new_content (str): Complete new content for the file after fixes
     """
-    name: str
-    content: str = ""
-    issue: Optional[Issue] = None
+    path: str
+    explanation: str
+    old_content: str
+    new_content: str
 
-    def __init__(self, **data):
-        super().__init__(**data)
-        if not self.content:
-            with open(self.name, "r", encoding="utf-8") as f:
-                self.content = f.read()
+    model_config = ConfigDict(populate_by_name=True)
 
-    def to_dict(self) -> dict:
-        """Convert the file to a dictionary for serialization"""
-        return {
-            "name": self.filename,
-            "content": self.content
-        }
+    def __repr__(self) -> str:
+        """Return a string representation of the proposed fix.
+
+        Returns:
+            str: Format: "<ProposedFix {path}>"
+        """
+        def short(s: str) -> str:
+            n = 40
+            if len(s) <= n:
+                return s
+            return s[:n] + "..."
+# pylint: disable=no-member
+        return (
+            f"<ProposedFix {self.path} "
+            f"expl='{short(self.explanation)}' "
+            f"new_content='{short(self.new_content)}'>"
+        )
+# pylint: enable=no-member
+
+    def to_prompt(self) -> str:
+        """Return a string representation of the proposed fix
+        in the format expected by the LLM.
+
+        Returns:
+            str: ....
+        """
+        width = 80
+
+        def wrap(text: str | None = None, ch: str = '=') -> str:
+            if text is None:
+                return width * ch
+            a = (width - len(text)) // 2 - 1
+            b = width - len(text) - a - 2
+            return a * ch + " " + text + " " + b * ch
+
+# pylint: disable=no-member
+        return (
+            wrap(ch='<') + "\n" +
+            wrap(self.path) + "\n" +
+            self.old_content + "\n" +
+            wrap() + "\n" +
+            self.explanation + "\n" +
+            wrap() + "\n" +
+            self.new_content + "\n" +
+            wrap(ch='>')
+        )
+# pylint: enable=no-member
+
+    async def apply(self) -> bool:
+        """Apply a a proposed fix.
+        """
+# pylint: disable=no-member
+        path = self.path
+        with open(path, "r", encoding="utf-8") as f:
+            old_content = f.read()
+        if old_content == self.new_content:
+            # the LLM didn't change the file, so stop
+            # trying to fix it, maybe issue a warning??
+            return False
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.new_content)
+        return True
+# pylint: enable=no-member
 
 
 class CustomHelpFormatter(
@@ -177,35 +335,46 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def generate_prompt(results: list[Issue],
-                    files: list[str]) -> str:
+def generate_prompt(results: list[CompletedLinterRun]) -> str:
     """Generate a prompt for the LLM
 
     Args:
-        results (list[Issue]): List of code quality issues found by checkers
+        results (list[CompletedLinterRun]): List of code quality issues found by checkers
         files (list[str]): List of file paths to check
 
     Returns:
         str: Formatted prompt text for the LLM
     """
-    _files = []
     lookup = {
-        issue.filename: issue
-        for issue in results
+        lrun.path: lrun
+        for lrun in results
     }
+    _files = sorted(lookup.keys())
     if DEBUG > 0:
         print(lookup)
-    _files = [
-        File(name=f, issue=lookup.get(f, None))
-        for f in files
-    ]
-    assert any(map(lambda f: f.issue is not None, _files)), _files
-    with open("prompt_template.md", "r", encoding="utf-8") as f:
-        template = jinja2.Template(f.read())
-        return template.render(files=_files)
+    template = jinja2.Template(PROMPT_TEMPLATE)
+    return template.render(files=_files, lookup=lookup)
 
 
-def _parse_llm_output(output: str) -> tuple[str, list[File]]:
+def _extract_filename(line: str) -> str | None:
+    """Extract filename from a markdown header line.
+
+    Args:
+        line (str): Line to parse
+
+    Returns:
+        str | None: Filename if found and valid, None otherwise
+    """
+    m = re.match(r"^ *###\s+(.*\.py)$", line)
+    if not m:
+        return None
+    fname = m.group(1)
+    if "path/to/file.py" in fname:
+        return None
+    return fname
+
+
+def _parse_llm_output(output: str) -> list[ProposedFix]:
     """Parse LLM output into explanation and new file versions.
 
     Parses Markdown-formatted LLM output that contains new file versions.
@@ -220,38 +389,56 @@ def _parse_llm_output(output: str) -> tuple[str, list[File]]:
         output (str): Raw LLM response text
 
     Returns:
-        tuple[str, list[File]]: Tuple containing:
-            - str: Text outside of file blocks (explanation)
-            - list[File]: List of new file contents
+        list[ProposedFix]: List of proposed fixes
     """
-    explanation = ""
-    new_version = None
+    proposed_fix = None
     fname = None
-    files = []
+    in_python = False
+    fix_list = []
+
     for line in output.split("\n"):
-        m = re.match(r"^ *###\s+(.*\.py)$", line)
-        if m:
-            fname = m.group(1)
-            if "path/to/file.py" in fname:
-                # Bad filename
-                fname = None
-            explanation += line + "\n"
-        elif line.startswith("```python") and isinstance(fname, str):
-            assert new_version is None
-            new_version = File(name=fname)
-            new_version.content = ""
-        elif line.startswith("```") and new_version is not None:
-            # Handle end of new version
-            files.append(new_version)
-            new_version = None
-        elif new_version is not None:
-            new_version.content += line + "\n"
-        else:
-            explanation += line + "\n"
-    return explanation, files
+        # Check for filename header
+        new_fname = _extract_filename(line)
+        if new_fname:
+            if proposed_fix is not None:
+                fix_list.append(proposed_fix)
+            fname = new_fname
+            proposed_fix = ProposedFix(
+                path=fname,
+                explanation=line + "\n",
+                old_content=open(fname, "r", encoding="utf-8").read(),
+                new_content=""
+            )
+            continue
+
+        # Handle code blocks
+        if line.startswith("```python") and fname:
+            in_python = True
+            continue
+        if line.startswith("```") and proposed_fix:
+            in_python = False
+            continue
+
+# pylint: disable=no-member
+        # Add content to current fix
+        if proposed_fix:
+            if in_python:
+                proposed_fix.new_content += line + "\n"
+            else:
+                proposed_fix.explanation += line + "\n"
+# pylint: enable=no-member
+
+    # Add final fix if exists
+    if proposed_fix is not None:
+        fix_list.append(proposed_fix)
+
+    return fix_list
 
 
-async def get_llm_response(model: str, prompt: str, api_key: str, local: bool = False) -> tuple[str, list[File]]:
+async def get_llm_response(model: str,
+                           prompt: str,
+                           api_key: str,
+                           local: bool = False) -> list[ProposedFix]:
     """Get a response from either Groq API or local Ollama server.
 
     Args:
@@ -270,7 +457,7 @@ async def get_llm_response(model: str, prompt: str, api_key: str, local: bool = 
             response = requests.post(
                 'http://localhost:11434/api/generate',
                 json={'model': model, 'prompt': prompt, 'stream': False},
-                timeout=5*MINUTE
+                timeout=20*MINUTE
             )
         else:
             response = requests.post(
@@ -289,45 +476,17 @@ async def get_llm_response(model: str, prompt: str, api_key: str, local: bool = 
         response.raise_for_status()
         output = response.json()['response'] if local else response.json()['choices'][0]['message']['content']
         if DEBUG > 0:
-            print(output)
+            print("Output: ***[[[[[[\n" + output + "\n]]]]]]***")
+            if DEBUG > 1:
+                print("Bailing")
+                sys.exit(0)
         return _parse_llm_output(output)
     except requests.exceptions.RequestException as e:
         print(f"Error calling {'Ollama' if local else 'Groq'} API: {e}")
-        return "", []
+        return []
 
 
-async def run_check(cmd: str, source: str) -> Issue:
-    """Run a code quality check command locally.
-
-    Executes the command on the host machine and captures output.
-
-    Args:
-        cmd (str): Command to run (e.g. "pylint" or "ruff check --fix")
-        source (str): Path to the file to check
-
-    Returns:
-        Issue: Object containing:
-            - filename: Path to the file containing the issue
-            - code: Exit status of the check (0 for success)
-            - content: Combined stdout/stderr output
-    """
-    proc = await asyncio.create_subprocess_exec(
-        *(cmd + " " + source).split(),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    output, error = await proc.communicate()
-    if DEBUG:
-        print("OUT:" + output.decode())
-        print("ERR:" + error.decode())
-        if DEBUG > 2:
-            sys.exit(0)
-    return Issue(filename=source,
-                 code=proc.returncode,
-                 content=output.decode() + error.decode())
-
-
-async def run_all_checks(linters: str, *sources: str) -> list[Issue]:
+async def run_all_checks(linters: str, *sources: str) -> list[CompletedLinterRun]:
     """Run all code quality checks on the specified source files.
 
     Executes linters and tests in sequence, stopping at first failure.
@@ -348,70 +507,36 @@ async def run_all_checks(linters: str, *sources: str) -> list[Issue]:
         Checks are run in order and stop at first failure to avoid
         overwhelming the LLM with multiple types of errors at once.
     """
-    results: list[Issue] = []
+    results: list[CompletedLinterRun] = []
     for source in sources:
         for cmd in linters.split(","):
-            if cmd == "ruff":
-                cmd = "ruff check"
-            elif cmd == "pytest" and not source.startswith("test"):
+            if cmd == "pytest" and not source.startswith("test"):
                 continue
             print(f"$ {cmd} {source}")
-            issue = await run_check(cmd, source)
-            print(f"Exit status {issue.code}")
-            if issue.code != 0:
-                # only one issue per file for now
-                results.append(issue)
-                break
+            lrun = LinterRun(path=source, cmd=cmd)
+            results.append(await lrun.run())
     return results
 
 
-async def start_ollama_server(model: str) -> str:
-    """Start the Ollama server in a container."""
-    # Kill any container using port 11434
-    cmd = ["docker", "ps", "-q", "--filter", "publish=11434"]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE
-    )
-    output, _ = await proc.communicate()
-    if output:
-        container_id = output.decode().strip()
-        print(f"Stopping existing container {container_id}")
-        stop_cmd = ["docker", "stop", container_id]
-        proc = await asyncio.create_subprocess_exec(*stop_cmd)
-        await proc.wait()
+async def stop_existing_ollama(client: docker.DockerClient) -> None:
+    """Stop any existing Ollama containers using port 11434.
 
-    cmd = [
-        'docker', 'run', '--rm', '-d',
-        '-v', f"{os.path.expanduser('~/ollama_data')}:/root/.ollama",
-        '-p', '11434:11434',
-        'ollama/ollama', 'serve'
-    ]
-    if DEBUG:
-        print("Starting Ollama server with command:")
-        print(" ".join(cmd))
+    Args:
+        client: Docker client instance
+    """
+    try:
+        containers = client.containers.list(
+            filters={'publish': '11434'}
+        )
+        for container in containers:
+            print(f"Stopping existing container {container.id[:12]}")
+            container.stop()
+    except APIError as e:
+        print(f"Error checking for existing containers: {e}")
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    output, error = await proc.communicate()
-    if error:
-        raise subprocess.SubprocessError(f"Error starting Ollama server: {error.decode()}")
 
-    container_id = output.decode().strip()
-    print(f"Started container: {container_id}")
-
-    # Check container status
-    status_cmd = ['docker', 'inspect', container_id]
-    proc = await asyncio.create_subprocess_exec(
-        *status_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    await proc.communicate()
-    # Wait for server to be ready
+async def wait_for_server_ready() -> None:
+    """Wait for Ollama server to be ready to accept requests."""
     for _ in range(30):
         try:
             response = requests.get(
@@ -419,10 +544,18 @@ async def start_ollama_server(model: str) -> str:
                 timeout=5.0
             )
             if response.status_code == 200:
-                break
+                return
         except requests.exceptions.RequestException:
             await asyncio.sleep(1)
+    raise TimeoutError("Ollama server failed to become ready")
 
+
+async def pull_ollama_model(model: str) -> None:
+    """Pull the specified model using Ollama's API.
+
+    Args:
+        model: Name of the model to pull
+    """
     if DEBUG:
         print("Pulling the model")
     response = requests.post(
@@ -433,24 +566,54 @@ async def start_ollama_server(model: str) -> str:
     )
     response.raise_for_status()
     print(f"Successfully pulled model {model}")
-    return container_id
 
 
-async def apply_fixes(file: File, files: list[str]) -> None:
-    """Apply fixes to a file and update the files list if needed.
+async def start_ollama_server(model: str) -> str:
+    """Start the Ollama server in a container using Docker API.
 
     Args:
-        file: File object containing the new content
-        files: List of files being processed
-    """
-    old_content = open(file.name, "r", encoding="utf-8").read()
-    if old_content == file.content:
-        # the LLM didn't change the file, so stop trying to fix it
-        files.remove(file.name)
-        return
+        model: Name of the model to pull
 
-    with open(file.name, "w", encoding="utf-8") as f:
-        f.write(file.content)
+    Returns:
+        Container ID of the started server
+
+    Raises:
+        docker.errors.APIError: If server fails to start
+        requests.exceptions.RequestException: If model pull fails
+        TimeoutError: If server doesn't become ready
+    """
+    client = docker.from_env()
+
+    # Stop any existing Ollama containers
+    await stop_existing_ollama(client)
+
+    try:
+        # Start new Ollama container
+        container = client.containers.run(
+            'ollama/ollama',
+            command='serve',
+            detach=True,
+            remove=True,
+            ports={'11434/tcp': 11434},
+            volumes={
+                os.path.expanduser('~/ollama_data'): {
+                    'bind': '/root/.ollama',
+                    'mode': 'rw'
+                }
+            }
+        )
+        cid = container.id if isinstance(container.id, str) else "???"
+        print(f"Started container: {cid[:12]}")
+
+        # Wait for server and pull model
+        await wait_for_server_ready()
+        await pull_ollama_model(model)
+
+        return cid
+
+    except APIError as e:
+        print(f"Error starting Ollama container: {e}")
+        raise
 
 
 async def process_iteration(
@@ -459,7 +622,7 @@ async def process_iteration(
     api_key: str,
     local: bool,
     linters: str
-) -> tuple[str, bool]:
+) -> list[str] | None:
     """Process one iteration of the fix loop.
 
     Args:
@@ -470,46 +633,55 @@ async def process_iteration(
         linters: Comma-separated list of linters to run
 
     Returns:
-        tuple containing:
-        - explanation: LLM's explanation of changes
-        - should_continue: Whether to continue iterations
+        List of explanations for each fix, or None if no files were fixed
     """
     # Run checks
-    results: list[Issue] = await run_all_checks(linters, *files)
+    results: list[CompletedLinterRun] = await run_all_checks(linters, *files)
     if all(issue.code == 0 for issue in results):
-        return "", False
+        return None
 
     # Generate prompt
-    prompt = generate_prompt(results, files)
+    prompt = generate_prompt(results)
     if DEBUG > 0:
         print("Prompt: ***[[[[[[\n" + prompt + "\n]]]]]]***")
+        if DEBUG > 2:
+            print("Bailing")
+            sys.exit(0)
 
     # Get and apply fixes
-    explanation, noobs = await get_llm_response(model, prompt, api_key, local)
-    for file in noobs:
-        await apply_fixes(file, files)
+    fixes = await get_llm_response(model, prompt, api_key, local)
+    if DEBUG > 0:
+        print("Response: ***[[[[[[\n" +
+              "\n-=-=-=-=-=-\n".join(map(lambda f: f.to_prompt(), fixes)) +
+              "\n]]]]]]***")
+    for fix in fixes:
+        await fix.apply()
+    if DEBUG > 0:
+        print("Fixes have been applied")
 
-    if len(files) == 0:
+    if len(fixes) == 0:
         print("No files left to fix")
-        return explanation, False
+        return None
 
-    return explanation, True
+    return [fix.explanation for fix in fixes]
 
 
-async def main():
+async def main() -> None:
     """Main entry point"""
     args = parse_args()
     files = args.sources
     iterations = args.iterations
     history = []  # List of explanations
+    container = None
 
-    container_id = None
     try:
         if args.local:
+            client = docker.from_env()
             container_id = await start_ollama_server(args.model)
+            container = client.containers.get(container_id)
 
         while iterations > 0:
-            explanation, should_continue = await process_iteration(
+            maybe: list[str] | None = await process_iteration(
                 files,
                 args.model,
                 args.api_key,
@@ -517,10 +689,9 @@ async def main():
                 args.linters
             )
 
-            if explanation:
-                history.append(explanation)
-
-            if not should_continue:
+            if maybe is not None:
+                history.extend(maybe)
+            else:
                 break
 
             iterations -= 1
@@ -531,10 +702,11 @@ async def main():
     finally:
         print("\n".join(history))
         # Clean up server if it was started
-        if container_id:
-            cmd = ['docker', 'stop', container_id]
-            proc = await asyncio.create_subprocess_exec(*cmd)
-            await proc.wait()
+        if container:
+            try:
+                container.stop()
+            except (NotFound, APIError) as e:
+                print(f"Error stopping container: {e}")
 
 
 if __name__ == "__main__":

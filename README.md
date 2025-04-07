@@ -138,3 +138,49 @@ Here's a comparison of Ollama-supported language models suitable for code qualit
 *   **Task Specialization:** Models fine-tuned for code-specific tasks (like Code Llama and Qwen2.5-Coder) often outperform general-purpose models on coding benchmarks.
 *   **Multi-Language Support:** If you work with multiple programming languages, consider models with broad language support (like StarCoder2 and Qwen2.5-Coder).
 *   **Resource Constraints:** If you have limited computational resources, opt for smaller models or models designed for efficiency (like Phi-3).
+
+## Convenience Script
+
+The repository includes a convenience script that wraps the python script
+and manages the location of the python virtual environment.
+
+```bash
+./loop_runner [options] files...
+```
+
+You can use all the same options as when running directly:
+
+```bash
+# Example with Groq API (default)
+./loop_runner -d 1 example.py
+
+# Example with local Ollama
+./loop_runner -L -m codellama example.py
+
+# Example with Groq and custom model
+./loop_runner --model llama-3.3-70b-versatile example.py
+```
+
+You can install `loop_runner` to be runnable from any directory on your
+dev machine.
+
+1. Make the script executable:
+```bash
+chmod +x /path/to/loop_runner.py
+```
+
+2. Create a symbolic link in your PATH:
+```bash
+sudo ln -s /path/to/loop_runner /usr/local/bin/loop_runner
+```
+
+3. Set up your virtual environment and add to your .bashrc:
+```bash
+python -m venv /path/to/your/venv
+/path/to/your/venv/bin/pip install -r requirements.txt
+echo 'export LOOP_RUNNER_VENV=/path/to/your/venv' >> ~/.bashrc
+source ~/.bashrc
+```
+
+After this setup, you can run `loop_runner` from anywhere, and it will use the
+Python environment specified in `LOOP_RUNNER_VENV`.
