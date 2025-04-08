@@ -2,8 +2,8 @@
 """Code Quality Auto-Fix Loop Runner
 
 This script automates the process of fixing code quality issues by:
-1. Running code quality checks (pylint, flake8, pytest)
-2. Sending the output to an LLM (either Groq API or local Ollama)
+1. Running code quality checks (e.g. ruff, pylint, flake8, pytest)
+2. Asking an LLM (running on Ollama) to fix any issues found
 3. Applying the suggested fixes
 4. Repeating until all checks pass
 
@@ -28,6 +28,9 @@ Markdown format, which are then written back to disk:
 ```python
 # Complete corrected file content
 ```
+
+The LLM runs in a Docker container. Code checks and patching are
+done directly on the host machine.
 """
 
 import os
@@ -35,15 +38,24 @@ import sys
 import re
 import asyncio
 import argparse
-import jinja2
+import logging
+from datetime import datetime
 import requests
-from pydantic import BaseModel, ConfigDict
 import docker
-from docker.errors import NotFound, APIError
+from docker.errors import APIError
+from llm_wrangler import LLMWrangler, Platform
+from prompt_gen import generate_prompt
+from git_wrangler import GitWrangler
+from models import LinterRun, CompletedLinterRun, ProposedFix
 
 MINUTE: float = 60.0
-DEBUG: int = 0
 
+logger = logging.getLogger("loop_runner")
+handler = logging.StreamHandler(sys.stderr)
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(filename)s:%(lineno)d - %(levelname)s\n%(message)s'
+))
+logger.addHandler(handler)
 
 BRIEF_INTRO = """\
 This script automates the process of fixing code quality issues by:
@@ -93,172 +105,6 @@ it with the actual path to the file.
 """
 
 
-class LinterRun(BaseModel):
-    """Represents a linter run configuration before execution.
-
-    Attributes:
-        path (str): Path to the file being linted
-        cmd (str): Command used to run the linter
-    """
-    path: str
-    cmd: str
-    content: str   # contents of the file being linted
-
-    model_config = ConfigDict(frozen=True)
-
-    def __init__(self, path: str, cmd: str):
-        with open(path, "r", encoding="utf-8") as f:
-            super().__init__(
-                path=path,
-                cmd=cmd,
-                content=f.read()
-            )
-
-    async def run(self) -> 'CompletedLinterRun':
-        """Execute the linter command and return a CompletedLinterRun.
-
-        Returns:
-            CompletedLinterRun: A new instance with the run results
-        """
-        proc = await asyncio.create_subprocess_exec(
-            self.cmd, self.path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        code = -1 if proc.returncode is None else proc.returncode
-        stdout_str = stdout.decode()
-        stderr_str = stderr.decode()
-
-# pylint: disable=unexpected-keyword-arg
-        return CompletedLinterRun(
-            path=self.path,
-            cmd=self.cmd,
-            content=self.content,
-            code=code,
-            stdout=stdout_str,
-            stderr=stderr_str
-        )
-# pylint: enable=unexpected-keyword-arg
-
-
-class CompletedLinterRun(LinterRun):
-    """Represents a completed linter run with its outputs and status.
-
-    Attributes:
-        path (str): Path to the file being linted
-        cmd (str): Command used to run the linter
-        content (str): Contents of the file being linted
-        code (int): Return code from the linter (0 for success)
-        stdout (str): Standard output from the linter
-        stderr (str): Standard error from the linter
-    """
-    code: int
-    stdout: str
-    stderr: str
-
-    model_config = ConfigDict(frozen=True)
-
-    # pylint: disable=non-parent-init-called
-    # pylint: disable=super-init-not-called
-    def __init__(self, *, path: str, cmd: str, content: str, code: int, stdout: str, stderr: str):
-        BaseModel.__init__(
-            self,
-            path=path,
-            cmd=cmd,
-            content=content,
-            code=code,
-            stdout=stdout,
-            stderr=stderr
-        )
-    # pylint: enable=non-parent-init-called
-    # pylint: enable=super-init-not-called
-
-
-class ProposedFix(BaseModel):
-    """Represents a fix proposed by the LLM for a code quality issue.
-
-    This class encapsulates a proposed code fix, including the file path,
-    the LLM's explanation of the changes, and the new content to be written
-    to the file.
-
-    Attributes:
-        path (str): Path to the file being modified
-        explanation (str): LLM's explanation of what changes were made and why
-        new_content (str): Complete new content for the file after fixes
-    """
-    path: str
-    explanation: str
-    old_content: str
-    new_content: str
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    def __repr__(self) -> str:
-        """Return a string representation of the proposed fix.
-
-        Returns:
-            str: Format: "<ProposedFix {path}>"
-        """
-        def short(s: str) -> str:
-            n = 40
-            if len(s) <= n:
-                return s
-            return s[:n] + "..."
-# pylint: disable=no-member
-        return (
-            f"<ProposedFix {self.path} "
-            f"expl='{short(self.explanation)}' "
-            f"new_content='{short(self.new_content)}'>"
-        )
-# pylint: enable=no-member
-
-    def to_prompt(self) -> str:
-        """Return a string representation of the proposed fix
-        in the format expected by the LLM.
-
-        Returns:
-            str: ....
-        """
-        width = 80
-
-        def wrap(text: str | None = None, ch: str = '=') -> str:
-            if text is None:
-                return width * ch
-            a = (width - len(text)) // 2 - 1
-            b = width - len(text) - a - 2
-            return a * ch + " " + text + " " + b * ch
-
-# pylint: disable=no-member
-        return (
-            wrap(ch='<') + "\n" +
-            wrap(self.path) + "\n" +
-            self.old_content + "\n" +
-            wrap() + "\n" +
-            self.explanation + "\n" +
-            wrap() + "\n" +
-            self.new_content + "\n" +
-            wrap(ch='>')
-        )
-# pylint: enable=no-member
-
-    async def apply(self) -> bool:
-        """Apply a a proposed fix.
-        """
-# pylint: disable=no-member
-        path = self.path
-        with open(path, "r", encoding="utf-8") as f:
-            old_content = f.read()
-        if old_content == self.new_content:
-            # the LLM didn't change the file, so stop
-            # trying to fix it, maybe issue a warning??
-            return False
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(self.new_content)
-        return True
-# pylint: enable=no-member
-
-
 class CustomHelpFormatter(
         argparse.RawDescriptionHelpFormatter,
         argparse.ArgumentDefaultsHelpFormatter
@@ -279,9 +125,8 @@ def parse_args() -> argparse.Namespace:
 
     Returns:
         argparse.Namespace: Parsed command line arguments containing sources, debug level,
-                            model name, iterations, linters, and llm-url
+                          model name, iterations, linter-script, and llm-url
     """
-    global DEBUG
     parser = argparse.ArgumentParser(
         description=BRIEF_INTRO,
         formatter_class=CustomHelpFormatter
@@ -292,10 +137,14 @@ def parse_args() -> argparse.Namespace:
         help="Paths to code files or directories"
     )
     parser.add_argument(
+        "-s", "--linter-script",
+        default="./lint.sh",
+        help="Path to script that runs code quality checks"
+    )
+    parser.add_argument(
         "-d", "--debug",
-        type=int,
-        default=0,
-        help="how much debug output to produce"
+        action="store_true",
+        help="enable debug logging"
     )
     parser.add_argument(
         "-m", "--model",
@@ -314,11 +163,6 @@ def parse_args() -> argparse.Namespace:
         help="run a local LLM server using Ollama docker container"
     )
     parser.add_argument(
-        "--linters",
-        default="ruff,pylint,flake8,pytest",
-        help="comma-separated list of code quality checkers"
-    )
-    parser.add_argument(
         "--llm-url",
         default="https://api.groq.com/openai/v1/chat/completions",
         help="URL of the LLM server"
@@ -328,32 +172,19 @@ def parse_args() -> argparse.Namespace:
         help="Groq API key",
         default=os.getenv("GROQ_API_KEY", "????")
     )
+    parser.add_argument(
+        "-g", "--no-git",
+        action="store_true",
+        help="disable git operations (no branches or commits)"
+    )
     args = parser.parse_args()
-    DEBUG = args.debug
+    level = logging.DEBUG if args.debug else logging.INFO
+    logger.setLevel(level)
+    handler.setLevel(level)
     if args.model == "????":
-        args.model = "codellama" if args.local else "qwen-2.5-32b"
+        args.model = "llama3" if args.local else "llama-3.3-70b-versatile"
+    logger.info("Using model %s", args.model)
     return args
-
-
-def generate_prompt(results: list[CompletedLinterRun]) -> str:
-    """Generate a prompt for the LLM
-
-    Args:
-        results (list[CompletedLinterRun]): List of code quality issues found by checkers
-        files (list[str]): List of file paths to check
-
-    Returns:
-        str: Formatted prompt text for the LLM
-    """
-    lookup = {
-        lrun.path: lrun
-        for lrun in results
-    }
-    _files = sorted(lookup.keys())
-    if DEBUG > 0:
-        print(lookup)
-    template = jinja2.Template(PROMPT_TEMPLATE)
-    return template.render(files=_files, lookup=lookup)
 
 
 def _extract_filename(line: str) -> str | None:
@@ -374,39 +205,51 @@ def _extract_filename(line: str) -> str | None:
     return fname
 
 
-def _parse_llm_output(output: str) -> list[ProposedFix]:
+def _parse_llm_output(output: str) -> tuple[list[ProposedFix], str]:
     """Parse LLM output into explanation and new file versions.
 
-    Parses Markdown-formatted LLM output that contains new file versions.
     Expects format:
-    ### filename.py
-    ```python
-    # Used to be bad, now it's good
-    ```
-    Any text outside these blocks is treated as explanation.
 
-    Args:
-        output (str): Raw LLM response text
+        ### path/to/file.py
 
-    Returns:
-        list[ProposedFix]: List of proposed fixes
+        Explanation of changes...
+
+        ```python
+        def foo():
+            return "bar"
+        ```
+
+    Any text outside the triple-backtick block is treated as explanation.
     """
-    proposed_fix = None
-    fname = None
+    proposed_fix: ProposedFix | None = None
+    fname: str | None = None
     in_python = False
-    fix_list = []
+    fix_list: list[ProposedFix] = []
+    explanation: str = ""
+
+    # pylint: disable=no-member
+    def maybe_add_fix() -> None:
+        if proposed_fix is not None:
+            if "No changes needed for this file" in proposed_fix.new_content:
+                return
+            logger.debug("New version of %s:\n%s",
+                         proposed_fix.path,
+                         proposed_fix.new_content)
+            if proposed_fix.something_changed():
+                fix_list.append(proposed_fix)
+                logger.debug("Added %s to fix list", proposed_fix.path)
 
     for line in output.split("\n"):
         # Check for filename header
         new_fname = _extract_filename(line)
         if new_fname:
-            if proposed_fix is not None:
-                fix_list.append(proposed_fix)
+            maybe_add_fix()
             fname = new_fname
+            with open(fname, "r", encoding="utf-8") as f:
+                old_content = f.read()
             proposed_fix = ProposedFix(
                 path=fname,
-                explanation=line + "\n",
-                old_content=open(fname, "r", encoding="utf-8").read(),
+                old_content=old_content,
                 new_content=""
             )
             continue
@@ -419,102 +262,32 @@ def _parse_llm_output(output: str) -> list[ProposedFix]:
             in_python = False
             continue
 
-# pylint: disable=no-member
         # Add content to current fix
-        if proposed_fix:
-            if in_python:
-                proposed_fix.new_content += line + "\n"
-            else:
-                proposed_fix.explanation += line + "\n"
-# pylint: enable=no-member
-
-    # Add final fix if exists
-    if proposed_fix is not None:
-        fix_list.append(proposed_fix)
-
-    return fix_list
-
-
-async def get_llm_response(model: str,
-                           prompt: str,
-                           api_key: str,
-                           local: bool = False) -> list[ProposedFix]:
-    """Get a response from either Groq API or local Ollama server.
-
-    Args:
-        model (str): Name of the model to use
-        prompt (str): The formatted prompt to send
-        api_key (str): Groq API key (only used for remote)
-        local (bool): Whether to use local Ollama server
-
-    Returns:
-        tuple containing:
-        - explanation (str): LLM's explanation of changes
-        - new versions (list[File]): List of changed file contents
-    """
-    try:
-        if local:
-            response = requests.post(
-                'http://localhost:11434/api/generate',
-                json={'model': model, 'prompt': prompt, 'stream': False},
-                timeout=20*MINUTE
-            )
+        if proposed_fix is not None and in_python:
+            proposed_fix.new_content += line + "\n"
         else:
-            response = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                headers={
-                    'Authorization': f'Bearer {api_key}',
-                    'Content-Type': 'application/json'
-                },
-                json={
-                    'model': model,
-                    'messages': [{'role': 'user', 'content': prompt}],
-                    'temperature': 0.1
-                },
-                timeout=5*MINUTE
-            )
-        response.raise_for_status()
-        output = response.json()['response'] if local else response.json()['choices'][0]['message']['content']
-        if DEBUG > 0:
-            print("Output: ***[[[[[[\n" + output + "\n]]]]]]***")
-            if DEBUG > 1:
-                print("Bailing")
-                sys.exit(0)
-        return _parse_llm_output(output)
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling {'Ollama' if local else 'Groq'} API: {e}")
-        return []
+            explanation += line + "\n"
+
+    # pylint: enable=no-member
+    maybe_add_fix()
+    return fix_list, explanation
 
 
-async def run_all_checks(linters: str, *sources: str) -> list[CompletedLinterRun]:
-    """Run all code quality checks on the specified source files.
-
-    Executes linters and tests in sequence, stopping at first failure.
+async def run_all_checks(script: str, *sources: str) -> list[CompletedLinterRun]:
+    """Run code quality checks on the specified source files.
 
     Args:
-        linters (str): comma-separated list of linters to run
-                       (e.g. "ruff,pylint,flake8,pytest")
-        *sources: Variable number of source file paths or directories
-                  to check
+        script: Path to the linter script to run
+        *sources: Variable number of source file paths to check
 
     Returns:
-        List of issues, each containing:
-        - filename (str): Path to the file containing the issue
-        - code (int): Exit status of the check (0 for success)
-        - content (str): Combined stdout/stderr from the check
-
-    Note:
-        Checks are run in order and stop at first failure to avoid
-        overwhelming the LLM with multiple types of errors at once.
+        List of completed linter runs with results
     """
     results: list[CompletedLinterRun] = []
     for source in sources:
-        for cmd in linters.split(","):
-            if cmd == "pytest" and not source.startswith("test"):
-                continue
-            print(f"$ {cmd} {source}")
-            lrun = LinterRun(path=source, cmd=cmd)
-            results.append(await lrun.run())
+        print(f"$ {script} {source}")
+        lrun = LinterRun(path=source, cmd=script)
+        results.append(await lrun.run())
     return results
 
 
@@ -556,8 +329,7 @@ async def pull_ollama_model(model: str) -> None:
     Args:
         model: Name of the model to pull
     """
-    if DEBUG:
-        print("Pulling the model")
+    logger.debug("Pulling the model %s", model)
     response = requests.post(
         'http://localhost:11434/api/pull',
         headers={'Content-Type': 'application/json'},
@@ -565,7 +337,7 @@ async def pull_ollama_model(model: str) -> None:
         timeout=5*MINUTE
     )
     response.raise_for_status()
-    print(f"Successfully pulled model {model}")
+    logger.info("Successfully pulled model %s", model)
 
 
 async def start_ollama_server(model: str) -> str:
@@ -618,95 +390,66 @@ async def start_ollama_server(model: str) -> str:
 
 async def process_iteration(
     files: list[str],
-    model: str,
-    api_key: str,
-    local: bool,
-    linters: str
-) -> list[str] | None:
-    """Process one iteration of the fix loop.
-
-    Args:
-        files: List of files to process
-        model: Name of the LLM model to use
-        api_key: API key for Groq
-        local: Whether to use local Ollama
-        linters: Comma-separated list of linters to run
-
-    Returns:
-        List of explanations for each fix, or None if no files were fixed
-    """
-    # Run checks
-    results: list[CompletedLinterRun] = await run_all_checks(linters, *files)
+    llm: LLMWrangler,
+    linter_script: str
+) -> str:
+    """Process one iteration of the fix loop."""
+    results = await run_all_checks(linter_script, *files)
     if all(issue.code == 0 for issue in results):
         return None
 
-    # Generate prompt
-    prompt = generate_prompt(results)
-    if DEBUG > 0:
-        print("Prompt: ***[[[[[[\n" + prompt + "\n]]]]]]***")
-        if DEBUG > 2:
-            print("Bailing")
-            sys.exit(0)
+    prompt = generate_prompt(linter_script, results)
+    logger.debug("Prompt:\n%s", prompt)
 
-    # Get and apply fixes
-    fixes = await get_llm_response(model, prompt, api_key, local)
-    if DEBUG > 0:
-        print("Response: ***[[[[[[\n" +
-              "\n-=-=-=-=-=-\n".join(map(lambda f: f.to_prompt(), fixes)) +
-              "\n]]]]]]***")
+    response = await llm.submit(prompt)
+    logger.debug("Response:\n%s", response)
+    fixes, explanation = _parse_llm_output(response)
+    logger.debug("Fixes:\n%s", fixes)
+    logger.debug("Explanation:\n%s", explanation)
     for fix in fixes:
         await fix.apply()
-    if DEBUG > 0:
-        print("Fixes have been applied")
-
-    if len(fixes) == 0:
-        print("No files left to fix")
-        return None
-
-    return [fix.explanation for fix in fixes]
+    return explanation
 
 
 async def main() -> None:
-    """Main entry point"""
+    """Main entry point for the loop runner.
+
+    Parses arguments, sets up LLM and git services, and runs the fix loop
+    until either all checks pass or max iterations is reached.
+    """
     args = parse_args()
     files = args.sources
     iterations = args.iterations
-    history = []  # List of explanations
-    container = None
 
-    try:
-        if args.local:
-            client = docker.from_env()
-            container_id = await start_ollama_server(args.model)
-            container = client.containers.get(container_id)
+    git_wrangler = None if args.no_git else GitWrangler.create(path=os.getcwd())
+    if git_wrangler:
+        git_wrangler.start_branch(
+            datetime.now().isoformat()
+            .replace(":", "_").replace("-", "_").replace(".", "_")
+        )
 
+    platform: Platform = "ollama" if args.local else "groq"
+    async with await LLMWrangler.create(platform=platform, model=args.model, api_key=args.api_key) as llm:
         while iterations > 0:
-            maybe: list[str] | None = await process_iteration(
+            explanation: str = await process_iteration(
                 files,
-                args.model,
-                args.api_key,
-                args.local,
-                args.linters
+                llm,
+                args.linter_script
             )
 
-            if maybe is not None:
-                history.extend(maybe)
+            if git_wrangler:
+                commit_hash = git_wrangler.commit_fixes(files)
+                with open("FIXES.md", "a", encoding="utf-8") as f:
+                    f.write(f"\n### Fix Applied (commit: {commit_hash[:8]})\n\n{explanation}\n")
+                git_wrangler.commit_log("FIXES.md")
             else:
-                break
+                with open("FIXES.md", "a", encoding="utf-8") as f:
+                    f.write(f"\n### Fix Applied\n\n{explanation}\n")
 
             iterations -= 1
             if iterations == 0:
-                print("Max iterations reached")
-                print(f"There are still {len(files)} files with remaining issues")
-
-    finally:
-        print("\n".join(history))
-        # Clean up server if it was started
-        if container:
-            try:
-                container.stop()
-            except (NotFound, APIError) as e:
-                print(f"Error stopping container: {e}")
+                logger.warning("Max iterations reached")
+                logger.warning("There are still %d files with remaining issues", len(files))
 
 
 if __name__ == "__main__":

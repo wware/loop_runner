@@ -35,7 +35,7 @@ Before using `loop_runner.py`, ensure you have the following installed and confi
     python3 -m venv .venv
     source .venv/bin/activate
     ```
-*   **Python Version**: Python 3.8 or higher is required.
+*   **Python Version**: Python 3.10 or higher is required.
 
     ```
     python3 --version
@@ -50,7 +50,7 @@ Before using `loop_runner.py`, ensure you have the following installed and confi
 *   **Groq API Key**: Required if not using local mode. Get your API key from
     [https://console.groq.com](https://console.groq.com) and set it as an environment variable:
     ```
-    export GROQ_API_KEY=your_api_key_here
+    export GROQ_API_KEY=gsk_...
     ```
 
 ## Usage
