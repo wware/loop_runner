@@ -51,6 +51,11 @@ Your idea to split the linters and modification stages into separate shell scrip
 is a thoughtful approach that could enhance the flexibility, clarity, and
 maintainability of the framework. Here are some considerations and potential benefits:
 
+> One thing I've learned in working on this is that the prompt for the LLM can
+> be very finicky. If you get it wrong, the LLM will produce output that cannot
+> be correctly parsed. Getting this right is difficult and it's likely that each
+> LLM model may require its own carefully crafted prompt.
+
 ### **Benefits of Splitting Linters and Modifications:**
 
 1. **Improved Modularity:**
