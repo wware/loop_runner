@@ -3,4 +3,8 @@
 ruff check "$@"
 pylint "$@"
 flake8 "$@"
-pytest "$@"
+for file in "$@"; do
+    if [[ $(basename "$file") =~ ^test_ ]]; then
+        pytest "$file"
+    fi
+done

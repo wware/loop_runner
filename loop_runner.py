@@ -392,7 +392,7 @@ async def process_iteration(
     files: list[str],
     llm: LLMWrangler,
     linter_script: str
-) -> str:
+) -> str | None:
     """Process one iteration of the fix loop."""
     results = await run_all_checks(linter_script, *files)
     if all(issue.code == 0 for issue in results):
@@ -406,9 +406,11 @@ async def process_iteration(
     fixes, explanation = _parse_llm_output(response)
     logger.debug("Fixes:\n%s", fixes)
     logger.debug("Explanation:\n%s", explanation)
+    fixes_applied = False
     for fix in fixes:
-        await fix.apply()
-    return explanation
+        if await fix.apply():
+            fixes_applied = True
+    return explanation if fixes_applied else None
 
 
 async def main() -> None:
@@ -431,11 +433,13 @@ async def main() -> None:
     platform: Platform = "ollama" if args.local else "groq"
     async with await LLMWrangler.create(platform=platform, model=args.model, api_key=args.api_key) as llm:
         while iterations > 0:
-            explanation: str = await process_iteration(
+            explanation: str | None = await process_iteration(
                 files,
                 llm,
                 args.linter_script
             )
+            if explanation is None:
+                break
 
             if git_wrangler:
                 commit_hash = git_wrangler.commit_fixes(files)
@@ -449,7 +453,7 @@ async def main() -> None:
             iterations -= 1
             if iterations == 0:
                 logger.warning("Max iterations reached")
-                logger.warning("There are still %d files with remaining issues", len(files))
+                logger.warning("There may still be remaining issues")
 
 
 if __name__ == "__main__":
